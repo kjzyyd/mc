@@ -12,6 +12,8 @@
 ./mc.sh install paper 1.21.4    # 指定类型+版本安装
 ./mc.sh start / run / stop / restart / status
 ./mc.sh settings                # 全中文分类设置(基础/世界/玩法/性能/内存/高级)
+# 服务端包装好后即缓存：同类型+同版本再跑 install 不会重复下载，直接复用
+./mc.sh on / off / rs / st      # 快捷命令：开/停/重启/状态
 ./mc.sh cmd 'list'              # 给运行中的服务器发指令
 ./mc.sh console / log           # 附加控制台 / 实时日志
 ./mc.sh ps                      # 列出所有运行中的多开实例

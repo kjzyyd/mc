@@ -13,6 +13,7 @@
 #     ./mc.sh stop            # 优雅停机
 #     ./mc.sh restart         # 重启
 #     ./mc.sh status          # 运行状态
+#     快捷命令: on/up=开, off/down=停, rs/re=重启, st=状态
 #     ./mc.sh console         # 附加到服务器控制台
 #     ./mc.sh cmd 'say hi'    # 向运行中的服务器发一条指令
 #     ./mc.sh mod              # 交互: 粘贴 mod 下载链接, 自动下载到 mods 文件夹
@@ -291,6 +292,7 @@ install_server() {
   check_deps_lazy
   local dist="${1:-paper}" ver="${2:-}"
   load_conf
+  local prev_d="${DISTRIBUTION:-}" prev_v="${VERSION:-}"
   # 覆盖安装时清空旧产物字段
   DISTRIBUTION="$dist"
   BUILD="latest"
@@ -300,6 +302,15 @@ install_server() {
 
   if [ -n "$ver" ]; then VERSION="$ver"; else pick_version "$dist"; fi
   [ -n "$VERSION" ] || VERSION="latest"
+
+  # 已装过同类型+同版本 且 服务端文件还在 => 直接复用, 跳过重复下载
+  if [ "$prev_d" = "$dist" ] && [ "$prev_v" = "$VERSION" ] \
+     && [ -n "$SERVER_JAR" ] && [ -f "$MC_DIR/$SERVER_JAR" ]; then
+    say "已装好: $dist @ $VERSION, 直接复用, 不用再下载"
+    ensure_eula
+    ok "服务端可用了, 直接开服即可: ./mc.sh start (或菜单选 1)"
+    return 0
+  fi
 
   mkdir -p "$MC_DIR"
   cd "$MC_DIR"
@@ -933,11 +944,11 @@ main() {
   local action="${1:-menu}"; shift || true
   case "$action" in
     install)   install_server "${1:-paper}" "${2:-}" ;;
-    start)     start ;;
+    start|on|up)   start ;;
     run)       run_foreground ;;
-    stop)      stop ;;
-    restart)   stop; start ;;
-    status)    status ;;
+    stop|off|down) stop ;;
+    restart|rs|re) stop; start ;;
+    status|st) status ;;
     console)   attach ;;
     cmd)       cmd_send "${1?缺少指令参数字符串}" ;;
     log)       view_log ;;
