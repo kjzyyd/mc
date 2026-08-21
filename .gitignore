@@ -1,0 +1,14 @@
+# 运行产物
+world*/ 
+logs/
+crash-reports/
+*.log
+server.jar
+libraries/
+versions/
+config/
+run.sh
+user_jvm_args.txt
+eula.txt
+server.properties
+server-*.conf
