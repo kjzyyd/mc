@@ -62,14 +62,21 @@ _instance_default="${_instance_default:-server}"
 INSTANCE="${INSTANCE:-$_instance_default}"
 SNAME="mc-$INSTANCE"
 CONF="$MC_DIR/server-$INSTANCE.conf"
-UA="mc-oneshot/1.0 (https://github.com/yourname/mc-server-oneshot)"
-VANILLA_MANIFEST="https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
-PAPER_API="https://fill.papermc.io/v3/projects"
-FORGE_DATA="https://files.minecraftforge.net/net/minecraftforge/forge/promo_maven_slim.json"
-FORGE_MAVEN="https://maven.minecraftforge.net/net/minecraftforge/forge"
-NEOFORGE_META="https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml"
-NEOFORGE_MAVEN="https://maven.neoforged.net/releases/net/neoforged/neoforge"
-FABRIC_META="https://meta.fabricmc.net/v2/versions"
+UA="mc-oneshot/1.0 (https://github.com/kjzyyd/mc)"
+# 数据源地址可用环境变量覆盖, 便于指向镜像/代理(如大陆网络访问官方 API 被限速时)
+VANILLA_MANIFEST="${VANILLA_MANIFEST:-https://launchermeta.mojang.com/mc/game/version_manifest_v2.json}"
+PAPER_API="${PAPER_API:-https://fill.papermc.io/v3/projects}"
+FORGE_DATA="${FORGE_DATA:-https://files.minecraftforge.net/net/minecraftforge/forge/promo_maven_slim.json}"
+FORGE_MAVEN="${FORGE_MAVEN:-https://maven.minecraftforge.net/net/minecraftforge/forge}"
+NEOFORGE_META="${NEOFORGE_META:-https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml}"
+NEOFORGE_MAVEN="${NEOFORGE_MAVEN:-https://maven.neoforged.net/releases/net/neoforged/neoforge}"
+FABRIC_META="${FABRIC_META:-https://meta.fabricmc.net/v2/versions}"
+
+# 硬化版请求: 带连接/总超时 + 重试, 避免元数据 API 卡住或瞬时失败导致"获取版本错误"
+cget() { # 输出到 stdout; 失败返回非 0
+  curl -sfL -A "$UA" --connect-timeout 8 --max-time 25 \
+       --retry 2 --retry-delay 1 --retry-all-errors "$@"
+}
 
 export JVM_FLAGS=""
 
@@ -138,28 +145,28 @@ auto_ram() {
 # ------------------------------ 下载器 --------------------------------------
 # vanilla: 官方原版
 list_vanilla() { # -> 空格分隔 id:type
-  curl -sfL -H "User-Agent: $UA" "$VANILLA_MANIFEST" \
+  cget "$VANILLA_MANIFEST" \
     | jq -r '.versions[] | select(.type=="release" or .type=="snapshot") | .id'
 }
 dl_vanilla() { # (version) -> server.jar
   local v="$1" m url jar
-  m=$(curl -sfL -H "User-Agent: $UA" "$VANILLA_MANIFEST") || die "无法获取原版版本清单"
+  m=$(cget "$VANILLA_MANIFEST") || die "无法获取原版版本清单"
   url=$(echo "$m" | jq -r --arg v "$v" '.versions[]|select(.id==$v)|.url')
   [ -n "$url" ] && [ "$url" != "null" ] || die "原版没有该版本: $v"
-  jar=$(curl -sfL -H "User-Agent: $UA" "$url" | jq -r '.downloads.server.url') \
+  jar=$(cget "$url" | jq -r '.downloads.server.url') \
     || die "无法解析 $v 下载地址"
-  curl -sfL -H "User-Agent: $UA" -o server.jar "$jar" || die "下载失败: $jar"
+  cget -o server.jar "$jar" || die "下载失败: $jar"
 }
 
 # Fill v3 (paper / purpur / waterfall / bungeecord ...)
 list_paper() { # (project) -> versions newest-first, 逗号分隔-> 换行
   local proj="$1"
-  curl -sfL -H "User-Agent: $UA" "$PAPER_API/$proj" \
+  cget "$PAPER_API/$proj" \
     | jq -r '.versions | to_entries | sort_by(.key) | reverse | map(.key)[]'
 }
 paper_download_urls() { # (project version) -> stdout: one download url
   local proj="$1" v="$2" json url
-  json=$(curl -sfL -H "User-Agent: $UA" "$PAPER_API/$proj/versions/$v/builds") || return 1
+  json=$(cget "$PAPER_API/$proj/versions/$v/builds") || return 1
   url=$(echo "$json" | jq -r '
         ( [ .[] | select(.channel=="STABLE" or .channel=="RECOMMENDED") ] | last
           .downloads."server:default".url ) // ( .[] | last | .downloads."server:default".url // empty )')
@@ -173,33 +180,33 @@ dl_paper() { # (project version) -> server.jar
   local proj="$1" v="$2" url
   url=$(paper_download_urls "$proj" "$v")
   [ -n "$url" ] || die "$proj $v 没有可用 STABLE 构建(或网络不通)"
-  curl -sfL -H "User-Agent: $UA" -o server.jar "$url" || die "下载失败: $url"
+  cget -o server.jar "$url" || die "下载失败: $url"
 }
 
 # Fabric: 单文件启动物 + 首次运行联网补库
 list_fabric() {
-  curl -sfL -H "User-Agent: $UA" "$FABRIC_META/game" \
+  cget "$FABRIC_META/game" \
     | jq -r '.[] | select(.stable==true) | .version'
 }
 dl_fabric() { # (mc version) -> server.jar
   local v="$1" loader installer
-  loader=$(curl -sfL -H "User-Agent: $UA" "$FABRIC_META/loader/$v" | jq -r '.[0].loader.version') \
+  loader=$(cget "$FABRIC_META/loader/$v" | jq -r '.[0].loader.version') \
     || die "未获取到 $v 的 fabric loader"
-  installer=$(curl -sfL -H "User-Agent: $UA" "$FABRIC_META/installer" | jq -r '.[0].version')
-  curl -sfL -H "User-Agent: $UA" -o server.jar \
+  installer=$(cget "$FABRIC_META/installer" | jq -r '.[0].version')
+  cget -o server.jar \
     "$FABRIC_META/loader/$v/$loader/$installer/server/jar" || die "fabric 服务端下载失败"
 }
 
 # Forge(经典 MinecraftForge): 通过 --installServer 生成启动环境
 list_forge() { # MC 版本(有 forge 支持的最新在前)
-  curl -sfL -H "User-Agent: $UA" "$FORGE_DATA" \
+  cget "$FORGE_DATA" \
     | jq -r '.promos | to_entries
              | map(select(.key|test("-(recommended|latest)$")))
              | map(.key | sub("-(recommended|latest)$";""))
              | unique | sort | reverse[]'
 }
 forge_build() { # (mc) -> 最新 forge 构建号
-  curl -sfL -H "User-Agent: $UA" "$FORGE_DATA" \
+  cget "$FORGE_DATA" \
     | jq -r --arg rec "$1-recommended" --arg lat "$1-latest" '.promos[$rec] // .promos[$lat]'
 }
 dl_forge() { # (mc version) 安装 forge
@@ -208,7 +215,7 @@ dl_forge() { # (mc version) 安装 forge
   [ -n "$fb" ] && [ "$fb" != "null" ] || die "forge 没有 $v 对应的构建"
   FORGE_VERSION="$fb"
   inst="forge-$v-$fb-installer.jar"
-  curl -sfL -H "User-Agent: $UA" -o "$inst" "$FORGE_MAVEN/$v-$fb/$inst" || die "forge 安装器下载失败"
+  cget -o "$inst" "$FORGE_MAVEN/$v-$fb/$inst" || die "forge 安装器下载失败"
   need_cmd java || die "forge 安装需要 java"
   java="$(command -v java)"
   say "运行 Forge 安装器 --installServer ..."
@@ -222,13 +229,13 @@ dl_forge() { # (mc version) 安装 forge
 
 # NeoForge: 自 1.20.5 起的主流 mod 平台, 同样走 --installServer
 list_neoforge() { # neoforge 版本号(新版在前)
-  curl -sfL -H "User-Agent: $UA" "$NEOFORGE_META" \
+  cget "$NEOFORGE_META" \
     | grep -o '<version>[^<]*</version>' | sed -E 's#</?version>##g' | grep -v '^$' | tac
 }
 dl_neoforge() { # (neoforge version)
   local ver="$1" inst java
   inst="neoforge-$ver-installer.jar"
-  curl -sfL -H "User-Agent: $UA" -o "$inst" "$NEOFORGE_MAVEN/$ver/$inst" \
+  cget -o "$inst" "$NEOFORGE_MAVEN/$ver/$inst" \
     || die "neoforge 安装器下载失败"
   need_cmd java || die "neoforge 安装需要 java"
   java="$(command -v java)"
@@ -258,7 +265,12 @@ pick_version() {
   say "获取 $dist 可选版本中..."
   local raw=()
   while IFS= read -r l; do raw+=( "$l" ); done < <(list_dist "$dist")
-  [ ${#raw[@]} -gt 0 ] || die "无法获取版本列表(可能网络受限), 可手动指定: ./mc.sh install $dist <版本>"
+  if [ ${#raw[@]} -eq 0 ]; then
+    if ! command -v jq >/dev/null 2>&1; then
+      die "缺少依赖 jq(JAVA 版本列表解析工具), 请执行: sudo apt-get install -y jq ; 装完重试"
+    fi
+    die "获取 $dist 版本列表失败(官方 API 被屏蔽或超时), 可:\n  a) 用镜像: VANILLA_MANIFEST/PAPER_API/FABRIC_META/... 指向镜像后再试\n  b) 手动指定版本跳过列表: ./mc.sh install $dist <版本>"
+  fi
   # 去重并保留最新有序
   local uniq=() prev=""
   for l in "${raw[@]}"; do [ "$l" != "$prev" ] && uniq+=("$l"); prev="$l"; done

@@ -13,6 +13,8 @@
 ./mc.sh start / run / stop / restart / status
 ./mc.sh settings                # 全中文分类设置(基础/世界/玩法/性能/内存/高级)
 # 服务端包装好后即缓存：同类型+同版本再跑 install 不会重复下载，直接复用
+# 版本拉取带超时+重试；若官方元数据 API 被屏蔽/限速，可设环境变量指向镜像，例如：
+#   export VANILLA_MANIFEST=<镜像> PAPER_API=<镜像> FABRIC_META=<镜像> 再运行 ./mc.sh
 ./mc.sh on / off / rs / st      # 快捷命令：开/停/重启/状态
 ./mc.sh cmd 'list'              # 给运行中的服务器发指令
 ./mc.sh console / log           # 附加控制台 / 实时日志
