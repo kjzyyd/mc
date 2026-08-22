@@ -62,15 +62,18 @@ _instance_default="${_instance_default:-server}"
 INSTANCE="${INSTANCE:-$_instance_default}"
 SNAME="mc-$INSTANCE"
 CONF="$MC_DIR/server-$INSTANCE.conf"
-UA="mc-oneshot/1.0 (https://github.com/kjzyyd/mc)"
-# 数据源地址可用环境变量覆盖, 便于指向镜像/代理(如大陆网络访问官方 API 被限速时)
-VANILLA_MANIFEST="${VANILLA_MANIFEST:-https://launchermeta.mojang.com/mc/game/version_manifest_v2.json}"
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+# ---- 爬虫数据源(HTML 页面优先, 不依赖官方 JSON API) ----
+# 版本列表与下载链接都从"网页"上抓, 因为很多网络能正常浏览官网, 但屏蔽/限速 API 子域。
+# 地址可用环境变量覆盖, 便于指向镜像。
+MCVERSIONS="${MCVERSIONS:-https://mcversions.net}"            # 原版版本列表 + 官方直链
+DOWNLOAD_PAPER="${DOWNLOAD_PAPER:-https://download.papermc.io}" # Paper 系 HTML 目录
+FORGE_LIST="${FORGE_LIST:-https://files.minecraftforge.net/net/minecraftforge/forge/}" # Forge 目录页
+NEOFORGE_DIR="${NEOFORGE_DIR:-https://maven.neoforged.net/releases/net/neoforged/neoforge}" # NeoForge Maven 目录
+# 仅当上面 HTML 源不可达时的兜底(JSON 接口)
 PAPER_API="${PAPER_API:-https://fill.papermc.io/v3/projects}"
-FORGE_DATA="${FORGE_DATA:-https://files.minecraftforge.net/net/minecraftforge/forge/promo_maven_slim.json}"
-FORGE_MAVEN="${FORGE_MAVEN:-https://maven.minecraftforge.net/net/minecraftforge/forge}"
-NEOFORGE_META="${NEOFORGE_META:-https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml}"
-NEOFORGE_MAVEN="${NEOFORGE_MAVEN:-https://maven.neoforged.net/releases/net/neoforged/neoforge}"
 FABRIC_META="${FABRIC_META:-https://meta.fabricmc.net/v2/versions}"
+FORGE_MAVEN="${FORGE_MAVEN:-https://maven.minecraftforge.net/net/minecraftforge/forge}"
 
 # 硬化版请求: 带连接/总超时 + 重试, 避免元数据 API 卡住或瞬时失败导致"获取版本错误"
 cget() { # 输出到 stdout; 失败返回非 0
@@ -142,77 +145,103 @@ auto_ram() {
   echo "$half"
 }
 
-# ------------------------------ 下载器 --------------------------------------
-# vanilla: 官方原版
-list_vanilla() { # -> 空格分隔 id:type
-  cget "$VANILLA_MANIFEST" \
-    | jq -r '.versions[] | select(.type=="release" or .type=="snapshot") | .id'
+# ------------------------------ 下载器(爬虫优先) ------------------------------
+# 爬 HTML 页面拿版本列表与下载直链, 官方 JSON API 仅在 HTML 源不可达时兜底。
+
+# vanilla: 爬 mcversions.net(纯 HTML) 的版本链接, 最新在前
+list_vanilla() {
+  cget "$MCVERSIONS/" | grep -oE 'href="/download/[0-9][^"/]*"' \
+    | sed -E 's#href="/download/([^"]*)"#\1#' | head -n 80 || true
 }
-dl_vanilla() { # (version) -> server.jar
-  local v="$1" m url jar
-  m=$(cget "$VANILLA_MANIFEST") || die "无法获取原版版本清单"
-  url=$(echo "$m" | jq -r --arg v "$v" '.versions[]|select(.id==$v)|.url')
-  [ -n "$url" ] && [ "$url" != "null" ] || die "原版没有该版本: $v"
-  jar=$(cget "$url" | jq -r '.downloads.server.url') \
-    || die "无法解析 $v 下载地址"
+dl_vanilla() { # (version) -> server.jar  (爬下载页, 挖官方 piston 直链)
+  local v="$1" jar
+  jar=$(cget "$MCVERSIONS/download/$v" \
+        | grep -oE 'https://piston[^" ]*server\.jar' | head -n1 || true)
+  [ -n "$jar" ] || die "原版没有该版本或下载页未给出直链: $v"
   cget -o server.jar "$jar" || die "下载失败: $jar"
 }
 
-# Fill v3 (paper / purpur / waterfall / bungeecord ...)
-list_paper() { # (project) -> versions newest-first, 逗号分隔-> 换行
-  local proj="$1"
-  cget "$PAPER_API/$proj" \
-    | jq -r '.versions | to_entries | sort_by(.key) | reverse | map(.key)[]'
+# Paper 系 (paper / purpur / folia / waterfall / bungeecord):
+# 版本列表爬 download.papermc.io HTML 目录(每个版本一个文件夹); 目录不可达时回落到 mcversions 的 MC 版本
+list_paper() {
+  local proj="$1" out
+  out=$(cget "$DOWNLOAD_PAPER/$proj/" 2>/dev/null \
+        | grep -oE 'href="[0-9][^"]*/"' | sed -E 's#href="([^"]*)/"#\1#' || true)
+  if [ -z "$out" ]; then
+    say "(download.papermc.io 目录暂不可达, 用 mcversions 的 MC 版本兜底)"
+    out=$(cget "$MCVERSIONS/" | grep -oE 'href="/download/[0-9][^"/]*"' \
+          | sed -E 's#href="/download/([^"]*)"#\1#' || true)
+  fi
+  printf '%s\n' "$out"
 }
-paper_download_urls() { # (project version) -> stdout: one download url
+# 爬 download.papermc.io 构建目录取最新构建的 jar 直链; 不可达时回落官方 JSON API
+paper_jar_url() {
+  local proj="$1" v="$2" b url
+  b=$(cget "$DOWNLOAD_PAPER/$proj/$v/" 2>/dev/null \
+      | grep -oE 'href="[0-9]+/"' | sed -E 's#href="([0-9]+)/"#\1#' | sort -n | tail -n1 || true)
+  if [ -n "$b" ]; then
+    url=$(cget "$DOWNLOAD_PAPER/$proj/$v/$b/" 2>/dev/null \
+          | grep -oE 'href="[^"]*\.jar"' | sed -E 's#href="([^"]*)"#\1#' | head -n1 || true)
+    case "$url" in
+      http*) : ;;
+      "") url="" ;;
+      *) url="$DOWNLOAD_PAPER/$proj/$v/$b/$url" ;;
+    esac
+    [ -n "$url" ] && { echo "$url"; return 0; }
+  fi
+  warn "(构建目录不可达, 回落官方 API 取下载地址)"
+  paper_download_urls_api "$proj" "$v"
+}
+# 兜底: 官方 JSON API 取构建下载地址
+paper_download_urls_api() {
   local proj="$1" v="$2" json url
   json=$(cget "$PAPER_API/$proj/versions/$v/builds") || return 1
   url=$(echo "$json" | jq -r '
         ( [ .[] | select(.channel=="STABLE" or .channel=="RECOMMENDED") ] | last
           .downloads."server:default".url ) // ( .[] | last | .downloads."server:default".url // empty )')
   if [ -n "$url" ] && [ "$url" != "null" ]; then echo "$url"; return 0; fi
-  # 兜底: 任意可用 server:default url
   url=$(echo "$json" | jq -r '[.[] | .downloads."server:default".url] | map(select(.!=null)) | last // empty')
   if [ -n "$url" ] && [ "$url" != "null" ]; then echo "$url"; return 0; fi
   return 1
 }
 dl_paper() { # (project version) -> server.jar
   local proj="$1" v="$2" url
-  url=$(paper_download_urls "$proj" "$v")
-  [ -n "$url" ] || die "$proj $v 没有可用 STABLE 构建(或网络不通)"
+  url=$(paper_jar_url "$proj" "$v")
+  [ -n "$url" ] || die "$proj $v 没有可用构建(或网络不通)"
   cget -o server.jar "$url" || die "下载失败: $url"
 }
 
-# Fabric: 单文件启动物 + 首次运行联网补库
+# Fabric: 官方无 HTML 版本页, 版本列表借用 mcversions(爬虫); 拼装服务端仍需 meta API(唯一来源)
 list_fabric() {
-  cget "$FABRIC_META/game" \
-    | jq -r '.[] | select(.stable==true) | .version'
+  cget "$MCVERSIONS/" | grep -oE 'href="/download/[0-9][^"/]*"' \
+    | sed -E 's#href="/download/([^"]*)"#\1#' | head -n 40 || true
 }
 dl_fabric() { # (mc version) -> server.jar
   local v="$1" loader installer
-  loader=$(cget "$FABRIC_META/loader/$v" | jq -r '.[0].loader.version') \
-    || die "未获取到 $v 的 fabric loader"
-  installer=$(cget "$FABRIC_META/installer" | jq -r '.[0].version')
+  loader=$(cget "$FABRIC_META/loader/$v" | jq -r '.[0].loader.version' 2>/dev/null || true)
+  [ -n "$loader" ] && [ "$loader" != "null" ] \
+    || die "Fabric 暂不支持该版本: $v (版本列表为通用 MC 版本, 请换一个较新的)"
+  installer=$(cget "$FABRIC_META/installer" | jq -r '.[0].version' 2>/dev/null || true)
   cget -o server.jar \
     "$FABRIC_META/loader/$v/$loader/$installer/server/jar" || die "fabric 服务端下载失败"
 }
 
 # Forge(经典 MinecraftForge): 通过 --installServer 生成启动环境
-list_forge() { # MC 版本(有 forge 支持的最新在前)
-  cget "$FORGE_DATA" \
-    | jq -r '.promos | to_entries
-             | map(select(.key|test("-(recommended|latest)$")))
-             | map(.key | sub("-(recommended|latest)$";""))
-             | unique | sort | reverse[]'
+# 版本列表爬 files.minecraftforge.net 网页里 li-version-list 区块(只取 MC 版本);
+# 页面另有独立的 Forge 构建号列表(如 65.1.2), 需避开, 安装器走 maven.minecraftforge.net(HTML Maven)
+list_forge() { # MC 版本(有 forge 支持, 新版在前)
+  cget "$FORGE_LIST" | tr -d '\n' \
+    | grep -oE 'collapsible-icon"[^>]*></span>[[:space:]]*[0-9][0-9.]*' \
+    | grep -oE '[0-9][0-9.]*$' | sort -u -V -r || true
 }
-forge_build() { # (mc) -> 最新 forge 构建号
-  cget "$FORGE_DATA" \
-    | jq -r --arg rec "$1-recommended" --arg lat "$1-latest" '.promos[$rec] // .promos[$lat]'
+forge_build() { # (mc) -> 最新 forge 构建号(爬 index_<mc>.html, 取最高)
+  cget "${FORGE_LIST}index_$1.html" | sed -e 's/<[^>]*>/ /g' \
+    | grep -oE "$1-[0-9]+\.[0-9]+\.[0-9]+" | sort -u -V -r | head -n1 || true
 }
 dl_forge() { # (mc version) 安装 forge
   local v="$1" fb inst java
   fb=$(forge_build "$v")
-  [ -n "$fb" ] && [ "$fb" != "null" ] || die "forge 没有 $v 对应的构建"
+  [ -n "$fb" ] || die "forge 没有 $v 对应的构建"
   FORGE_VERSION="$fb"
   inst="forge-$v-$fb-installer.jar"
   cget -o "$inst" "$FORGE_MAVEN/$v-$fb/$inst" || die "forge 安装器下载失败"
@@ -228,14 +257,15 @@ dl_forge() { # (mc version) 安装 forge
 }
 
 # NeoForge: 自 1.20.5 起的主流 mod 平台, 同样走 --installServer
+# 版本列表与安装器都爬 Maven 目录页(纯 HTML 列表)
 list_neoforge() { # neoforge 版本号(新版在前)
-  cget "$NEOFORGE_META" \
-    | grep -o '<version>[^<]*</version>' | sed -E 's#</?version>##g' | grep -v '^$' | tac
+  cget "$NEOFORGE_DIR/" | grep -oE '>[0-9]+\.[0-9]+\.[0-9]+/' \
+    | sed -E 's/[>/]//g' | sort -u -V -r || true
 }
 dl_neoforge() { # (neoforge version)
   local ver="$1" inst java
   inst="neoforge-$ver-installer.jar"
-  cget -o "$inst" "$NEOFORGE_MAVEN/$ver/$inst" \
+  cget -o "$inst" "$NEOFORGE_DIR/$ver/$inst" \
     || die "neoforge 安装器下载失败"
   need_cmd java || die "neoforge 安装需要 java"
   java="$(command -v java)"
@@ -269,7 +299,7 @@ pick_version() {
     if ! command -v jq >/dev/null 2>&1; then
       die "缺少依赖 jq(JAVA 版本列表解析工具), 请执行: sudo apt-get install -y jq ; 装完重试"
     fi
-    die "获取 $dist 版本列表失败(官方 API 被屏蔽或超时), 可:\n  a) 用镜像: VANILLA_MANIFEST/PAPER_API/FABRIC_META/... 指向镜像后再试\n  b) 手动指定版本跳过列表: ./mc.sh install $dist <版本>"
+    die "获取 $dist 版本列表失败(官方网页被屏蔽或超时), 可:\n  a) 用镜像: 设 MCVERSIONS/DOWNLOAD_PAPER/FORGE_LIST/NEOFORGE_DIR 指向镜像后再试\n  b) 手动指定版本跳过列表: ./mc.sh install $dist <版本>"
   fi
   # 去重并保留最新有序
   local uniq=() prev=""
